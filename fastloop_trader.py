@@ -64,6 +64,8 @@ CONFIG_SCHEMA = {
                "help": "Market window duration (5m or 15m)"},
     "volume_confidence": {"default": True, "env": "SIMMER_SPRINT_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
+    "daily_budget": {"default": 10.0, "env": "SIMMER_SPRINT_DAILY_BUDGET", "type": float,
+                     "help": "Max total spend per UTC day"},
 }
 
 TRADE_SOURCE = "sdk:fastloop"
@@ -148,26 +150,66 @@ MIN_TIME_REMAINING = cfg["min_time_remaining"]
 ASSET = cfg["asset"].upper()
 WINDOW = cfg["window"]  # "5m" or "15m"
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
+DAILY_BUDGET = cfg["daily_budget"]
+
+
+# =============================================================================
+# Daily Budget Tracking
+# =============================================================================
+
+def _get_spend_path(skill_file):
+    from pathlib import Path
+    return Path(skill_file).parent / "daily_spend.json"
+
+
+def _load_daily_spend(skill_file):
+    """Load today's spend. Resets if date != today (UTC)."""
+    spend_path = _get_spend_path(skill_file)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if spend_path.exists():
+        try:
+            with open(spend_path) as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"date": today, "spent": 0.0, "trades": 0}
+
+
+def _save_daily_spend(skill_file, spend_data):
+    """Save daily spend to file."""
+    spend_path = _get_spend_path(skill_file)
+    with open(spend_path, "w") as f:
+        json.dump(spend_data, f, indent=2)
 
 
 # =============================================================================
 # API Helpers
 # =============================================================================
 
-SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
+_client = None
 
-
-def get_api_key():
-    key = os.environ.get("SIMMER_API_KEY")
-    if not key:
-        print("Error: SIMMER_API_KEY environment variable not set")
-        print("Get your API key from: simmer.markets/dashboard → SDK tab")
-        sys.exit(1)
-    return key
+def get_client():
+    """Lazy-init SimmerClient singleton."""
+    global _client
+    if _client is None:
+        try:
+            from simmer_sdk import SimmerClient
+        except ImportError:
+            print("Error: simmer-sdk not installed. Run: pip install simmer-sdk")
+            sys.exit(1)
+        api_key = os.environ.get("SIMMER_API_KEY")
+        if not api_key:
+            print("Error: SIMMER_API_KEY environment variable not set")
+            print("Get your API key from: simmer.markets/dashboard → SDK tab")
+            sys.exit(1)
+        _client = SimmerClient(api_key=api_key, venue="polymarket")
+    return _client
 
 
 def _api_request(url, method="GET", data=None, headers=None, timeout=15):
-    """Make an HTTP request. Returns parsed JSON or None on error."""
+    """Make an HTTP request to external APIs (Binance, CoinGecko, Gamma). Returns parsed JSON or None on error."""
     try:
         req_headers = headers or {}
         if "User-Agent" not in req_headers:
@@ -189,14 +231,6 @@ def _api_request(url, method="GET", data=None, headers=None, timeout=15):
         return {"error": f"Connection error: {e.reason}"}
     except Exception as e:
         return {"error": str(e)}
-
-
-def simmer_request(path, method="GET", data=None, api_key=None):
-    """Make a Simmer API request."""
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return _api_request(f"{SIMMER_BASE}{path}", method=method, data=data, headers=headers)
 
 
 # =============================================================================
@@ -370,13 +404,13 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
 # Import & Trade
 # =============================================================================
 
-def import_fast_market_market(api_key, slug):
+def import_fast_market_market(slug):
     """Import a fast market to Simmer. Returns market_id or None."""
     url = f"https://polymarket.com/event/{slug}"
-    result = simmer_request("/api/sdk/markets/import", method="POST", data={
-        "polymarket_url": url,
-        "shared": True,
-    }, api_key=api_key)
+    try:
+        result = get_client().import_market(url)
+    except Exception as e:
+        return None, str(e)
 
     if not result:
         return None, "No response from import endpoint"
@@ -388,7 +422,6 @@ def import_fast_market_market(api_key, slug):
     market_id = result.get("market_id")
 
     if status == "resolved":
-        # Market resolved — check alternatives
         alternatives = result.get("active_alternatives", [])
         if alternatives:
             return None, f"Market resolved. Try alternative: {alternatives[0].get('id')}"
@@ -400,45 +433,61 @@ def import_fast_market_market(api_key, slug):
     return None, f"Unexpected status: {status}"
 
 
-def get_market_details(api_key, market_id):
+def get_market_details(market_id):
     """Fetch market details by ID."""
-    result = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
-    if not result or result.get("error"):
+    try:
+        market = get_client().get_market_by_id(market_id)
+        if not market:
+            return None
+        from dataclasses import asdict
+        return asdict(market)
+    except Exception:
         return None
-    return result.get("market", result)
 
 
-def get_portfolio(api_key):
+def get_portfolio():
     """Get portfolio summary."""
-    return simmer_request("/api/sdk/portfolio", api_key=api_key)
+    try:
+        return get_client().get_portfolio()
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def get_positions(api_key):
-    """Get current positions."""
-    result = simmer_request("/api/sdk/positions", api_key=api_key)
-    if isinstance(result, dict) and "positions" in result:
-        return result["positions"]
-    if isinstance(result, list):
-        return result
-    return []
+def get_positions():
+    """Get current positions as list of dicts."""
+    try:
+        positions = get_client().get_positions()
+        from dataclasses import asdict
+        return [asdict(p) for p in positions]
+    except Exception:
+        return []
 
 
-def execute_trade(api_key, market_id, side, amount):
+def execute_trade(market_id, side, amount):
     """Execute a trade on Simmer."""
-    return simmer_request("/api/sdk/trade", method="POST", data={
-        "market_id": market_id,
-        "side": side,
-        "amount": amount,
-        "venue": "polymarket",
-        "source": TRADE_SOURCE,
-    }, api_key=api_key)
+    try:
+        result = get_client().trade(
+            market_id=market_id,
+            side=side,
+            amount=amount,
+            source=TRADE_SOURCE,
+        )
+        return {
+            "success": result.success,
+            "trade_id": result.trade_id,
+            "shares_bought": result.shares_bought,
+            "shares": result.shares_bought,
+            "error": result.error,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def calculate_position_size(api_key, max_size, smart_sizing=False):
+def calculate_position_size(max_size, smart_sizing=False):
     """Calculate position size, optionally based on portfolio."""
     if not smart_sizing:
         return max_size
-    portfolio = get_portfolio(api_key)
+    portfolio = get_portfolio()
     if not portfolio or portfolio.get("error"):
         return max_size
     balance = portfolio.get("balance_usdc", 0)
@@ -477,6 +526,8 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"  Lookback:         {LOOKBACK_MINUTES} minutes")
     log(f"  Min time left:    {MIN_TIME_REMAINING}s")
     log(f"  Volume weighting: {'✓' if VOLUME_CONFIDENCE else '✗'}")
+    daily_spend = _load_daily_spend(__file__)
+    log(f"  Daily budget:     ${DAILY_BUDGET:.2f} (${daily_spend['spent']:.2f} spent today, {daily_spend['trades']} trades)")
 
     if show_config:
         config_path = _get_config_path(__file__)
@@ -487,12 +538,13 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f'    Or edit config.json directly')
         return
 
-    api_key = get_api_key()
+    # Initialize client early to validate API key
+    get_client()
 
     # Show positions if requested
     if positions_only:
         log("\n📊 Sprint Positions:")
-        positions = get_positions(api_key)
+        positions = get_positions()
         fast_market_positions = [p for p in positions if "up or down" in (p.get("question", "") or "").lower()]
         if not fast_market_positions:
             log("  No open fast market positions")
@@ -505,7 +557,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Show portfolio if smart sizing
     if smart_sizing:
         log("\n💰 Portfolio:")
-        portfolio = get_portfolio(api_key)
+        portfolio = get_portfolio()
         if portfolio and not portfolio.get("error"):
             log(f"  Balance: ${portfolio.get('balance_usdc', 0):.2f}")
 
@@ -617,8 +669,24 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             return
 
     # We have a signal!
-    position_size = calculate_position_size(api_key, MAX_POSITION_USD, smart_sizing)
+    position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing)
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
+
+    # Daily budget check
+    remaining_budget = DAILY_BUDGET - daily_spend["spent"]
+    if remaining_budget <= 0:
+        log(f"  ⏸️  Daily budget exhausted (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f} spent) — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (daily budget exhausted)")
+        return
+    if position_size > remaining_budget:
+        position_size = remaining_budget
+        log(f"  Budget cap: trade capped at ${position_size:.2f} (${daily_spend['spent']:.2f}/${DAILY_BUDGET:.2f} spent)")
+    if position_size < 0.50:
+        log(f"  ⏸️  Remaining budget ${position_size:.2f} < $0.50 — skip")
+        if not quiet:
+            print(f"📊 Summary: No trade (remaining budget too small)")
+        return
 
     # Check minimum order size
     if price > 0:
@@ -632,7 +700,7 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
 
     # Step 5: Import & Trade
     log(f"\n🔗 Importing to Simmer...", force=True)
-    market_id, import_error = import_fast_market_market(api_key, best["slug"])
+    market_id, import_error = import_fast_market_market(best["slug"])
 
     if not market_id:
         log(f"  ❌ Import failed: {import_error}", force=True)
@@ -645,12 +713,17 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
     else:
         log(f"  Executing {side.upper()} trade for ${position_size:.2f}...", force=True)
-        result = execute_trade(api_key, market_id, side, position_size)
+        result = execute_trade(market_id, side, position_size)
 
         if result and result.get("success"):
             shares = result.get("shares_bought") or result.get("shares") or 0
             trade_id = result.get("trade_id")
             log(f"  ✅ Bought {shares:.1f} {side.upper()} shares @ ${price:.3f}", force=True)
+
+            # Update daily spend
+            daily_spend["spent"] += position_size
+            daily_spend["trades"] += 1
+            _save_daily_spend(__file__, daily_spend)
 
             # Log to trade journal
             if trade_id and JOURNAL_AVAILABLE:
